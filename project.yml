@@ -7,6 +7,10 @@ name: TwinzoScan
 
 options:
   bundleIdPrefix: com.twinzo
+  # CI runs Xcode 15.4, which cannot open the newer xcodegen default project
+  # format (objectVersion 77, Xcode 16+). Pin the older compatibility format
+  # so the generated .xcodeproj is readable by Xcode 15.4.
+  objectVersion: 70
   deploymentTarget:
     # ARKit scene reconstruction and MeshDescriptor.materials both require 15;
     # 16 is a safe floor for the SwiftUI APIs used in the settings sheet.
