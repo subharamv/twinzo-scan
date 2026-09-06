@@ -191,8 +191,7 @@ extension ARMeshGeometry {
     /// producing scrambled geometry.
     func faceIndices() -> [UInt32] {
         let source = faces
-        guard source.primitive == .triangle,
-              source.bytesPerIndex == MemoryLayout<UInt32>.size
+        guard source.bytesPerIndex == MemoryLayout<UInt32>.size
         else { return [] }
 
         let total = source.count * source.indexCountPerPrimitive
