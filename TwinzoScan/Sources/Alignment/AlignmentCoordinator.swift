@@ -131,7 +131,7 @@ final class AlignmentCoordinator: ObservableObject {
             let fine = PointToPlaneICP.align(
                 points: points, to: mesh, initial: coarse.worldToModel, parameters: .fine
             )
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.applyRefinement(fine)
             }
         }

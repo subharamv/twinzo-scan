@@ -206,7 +206,7 @@ final class BVH {
     }
 
     private func halfArea(lo: SIMD3<Float>, hi: SIMD3<Float>) -> Float {
-        let e = max(hi - lo, .zero)
+        let e = max(hi - lo, SIMD3<Float>.zero)
         return e.x * e.y + e.y * e.z + e.z * e.x
     }
 
@@ -269,7 +269,7 @@ final class BVH {
     private func boxDistanceSquared(
         _ p: SIMD3<Float>, _ lo: SIMD3<Float>, _ hi: SIMD3<Float>
     ) -> Float {
-        let d = max(max(lo - p, p - hi), .zero)
+        let d = max(max(lo - p, p - hi), SIMD3<Float>.zero)
         return dot(d, d)
     }
 

@@ -93,10 +93,10 @@ enum BIMModelLoader {
     ) {
         let worldTransform = parentTransform * entity.transform.matrix
 
-        // The subscript is already generic over the component type and returns
-        // `ModelComponent?`; casting it again is redundant and does not compile
-        // against current RealityKit.
-        if let model = entity.components[ModelComponent.self] {
+        // The subscript's typing differs between SDK versions: newer RealityKit
+        // emits the typed `ModelComponent?`, while the Xcode 15.4 SDK emits
+        // `any Component`. Casting covers both.
+        if let model = entity.components[ModelComponent.self] as? ModelComponent {
             append(mesh: model.mesh, transform: worldTransform, into: &triangles)
         }
         for child in entity.children {
