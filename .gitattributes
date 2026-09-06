@@ -1,0 +1,21 @@
+# Normalise on commit, check out native. Authored on Windows, built on macOS.
+* text=auto
+
+# These are executed, not read. CRLF makes them fail on macOS and Linux with an
+# opaque "bad interpreter" error, so pin them regardless of platform.
+*.sh text eol=lf
+
+# Swift and shader sources: keep LF everywhere so xcodebuild and swiftc see the
+# same bytes CI does.
+*.swift text eol=lf
+*.metal text eol=lf
+*.h text eol=lf
+
+*.yml text eol=lf
+*.plist text eol=lf
+*.md text eol=lf
+
+# Site models are binary if they ever get committed deliberately.
+*.usdz binary
+*.reality binary
+*.ply binary

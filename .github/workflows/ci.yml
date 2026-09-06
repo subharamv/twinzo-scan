@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The reason this workflow exists: verify the iOS app actually compiles.
+  # Nothing on a Windows machine can do this, and these are the errors most
+  # likely to be waiting — RealityKit and ARKit API details.
+  ios-build:
+    name: Build iOS app
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build
+        # Code signing is disabled and the destination is a generic device:
+        # this proves the code compiles and links, which is all CI can do
+        # without a provisioning profile or a physical LiDAR device.
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project TwinzoScan.xcodeproj \
+            -scheme TwinzoScan \
+            -destination 'generic/platform=iOS' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            | xcpretty || xcodebuild build \
+            -project TwinzoScan.xcodeproj \
+            -scheme TwinzoScan \
+            -destination 'generic/platform=iOS' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+  # Geometry and registration tests, running against the same sources the app
+  # ships. Linux rather than Windows purely for CI reliability — the package is
+  # platform-independent and `swift test` behaves the same on both.
+  core-tests:
+    name: Geometry and ICP tests
+    runs-on: ubuntu-latest
+    container: swift:5.9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: swift test --enable-test-discovery
+
+  # Catches the Metal kernel's syntax and type errors. It cannot verify the
+  # traversal is correct — only a device can — but a shader that fails to
+  # compile takes the whole deviation pass down at runtime with a nil pipeline.
+  metal-shader:
+    name: Compile Metal shader
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Compile for iOS
+        run: |
+          xcrun -sdk iphoneos metal \
+            -c TwinzoScan/Resources/Shaders/Deviation.metal \
+            -o /tmp/Deviation.air

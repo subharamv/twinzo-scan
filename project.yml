@@ -1,0 +1,38 @@
+# XcodeGen spec. Generate the Xcode project with:
+#   brew install xcodegen && xcodegen generate
+#
+# A generated project is used rather than a checked-in .xcodeproj because the
+# pbxproj format merges badly and this tree is expected to gain source files.
+name: TwinzoScan
+
+options:
+  bundleIdPrefix: com.twinzo
+  deploymentTarget:
+    # ARKit scene reconstruction and MeshDescriptor.materials both require 15;
+    # 16 is a safe floor for the SwiftUI APIs used in the settings sheet.
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""          # set your team, or configure signing in Xcode
+    MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+
+targets:
+  TwinzoScan:
+    type: application
+    platform: iOS
+    sources:
+      - path: TwinzoScan/Sources
+      - path: TwinzoScan/Resources
+        # Info.plist is referenced through INFOPLIST_FILE, not compiled in.
+        excludes:
+          - "Info.plist"
+    info:
+      path: TwinzoScan/Resources/Info.plist
+    settings:
+      base:
+        INFOPLIST_FILE: TwinzoScan/Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.twinzo.scan
+        TARGETED_DEVICE_FAMILY: "1,2"
