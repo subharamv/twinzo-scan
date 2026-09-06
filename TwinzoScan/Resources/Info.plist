@@ -19,6 +19,15 @@
         <string>iphone-ipad-minimum-performance-a12</string>
     </array>
 
+    <!-- Full-screen-only: correct for an AR scanning session and it lets the
+         app legitimately skip the upside-down orientation on iPad. -->
+    <key>UIRequiresFullScreen</key>
+    <true/>
+
+    <!-- Launch screen storyboard (required for App Store submission). -->
+    <key>UILaunchStoryboardName</key>
+    <string>LaunchScreen</string>
+
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
@@ -32,11 +41,5 @@
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
-
-    <key>UILaunchScreen</key>
-    <dict>
-        <key>UIColorName</key>
-        <string></string>
-    </dict>
 </dict>
 </plist>
