@@ -31,24 +31,48 @@ struct GPUBVHNode {
     var isLeaf: Bool { triCount != 0 }
 }
 
-/// A triangle in BIM-model space. `w` lanes are unused padding.
+/// A triangle in BIM-model space.
+///
+/// The `w` lane of `v0` carries the owning element's index into
+/// `BIMModel.elements`, bit-cast the same way the BVH node packs its child
+/// pointer. Riding along inside the triangle rather than in a parallel array is
+/// what keeps element identity correct through the BVH's in-place partition
+/// swaps — and it means the GPU can report "which element" for free, with no
+/// extra buffer and no change to the 48-byte stride the kernel already reads.
+///
+/// `v1.w` and `v2.w` remain unused padding.
 struct GPUTriangle {
     var v0: SIMD4<Float>
     var v1: SIMD4<Float>
     var v2: SIMD4<Float>
 
-    init(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>) {
-        v0 = SIMD4(a, 0); v1 = SIMD4(b, 0); v2 = SIMD4(c, 0)
+    /// Element index meaning "no owning element known".
+    static let unattributedElement: UInt32 = 0xFFFF_FFFF
+
+    init(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>,
+         element: UInt32 = GPUTriangle.unattributedElement) {
+        v0 = SIMD4(a, Float(bitPattern: element))
+        v1 = SIMD4(b, 0)
+        v2 = SIMD4(c, 0)
     }
 
     var a: SIMD3<Float> { v0.xyz }
     var b: SIMD3<Float> { v1.xyz }
     var c: SIMD3<Float> { v2.xyz }
 
+    var elementIndex: UInt32 {
+        get { v0.w.bitPattern }
+        set { v0.w = Float(bitPattern: newValue) }
+    }
+
     var centroid: SIMD3<Float> { (a + b + c) / 3 }
 
     /// Unnormalised geometric normal; degenerate triangles yield ~zero length.
     var faceNormal: SIMD3<Float> { cross(b - a, c - a) }
+
+    /// Surface area in square metres. Used to area-weight element coverage, so a
+    /// dense mesh of slivers cannot outvote one large wall face.
+    var area: Float { length(faceNormal) * 0.5 }
 }
 
 /// Parameters handed to the deviation kernel each frame.

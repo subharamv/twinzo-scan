@@ -9,11 +9,14 @@ struct BVHNode {
     float4 boundsMaxAndCount;      // xyz = max corner, w = triangle count (0 = interior)
 };
 
+// v0.w carries the owning element's index, bit-cast to uint. See GPUTypes.swift.
 struct Triangle {
     float4 v0;
     float4 v1;
     float4 v2;
 };
+
+constant uint kUnattributedElement = 0xFFFFFFFFu;
 
 struct DeviationUniforms {
     float4x4 worldToModel;
@@ -82,6 +85,11 @@ static inline float3 closestPointOnTriangle(float3 p, Triangle tri) {
 struct ClosestResult {
     float distance;
     float signedDistance;  // negative = scanned surface sits behind the BIM face
+    // Model-space vector from the design surface to the scanned point. Its
+    // per-axis components are what the element readout reports as dX/dY/dZ; a
+    // scalar distance cannot tell an inspector which way a column leans.
+    float3 delta;
+    uint element;
     bool found;
 };
 
@@ -96,6 +104,8 @@ static ClosestResult closestSurface(float3 query,
     ClosestResult result;
     result.distance = maxDistance;
     result.signedDistance = maxDistance;
+    result.delta = float3(0.0);
+    result.element = kUnattributedElement;
     result.found = false;
 
     float bestDistSq = maxDistance * maxDistance;
@@ -127,6 +137,8 @@ static ClosestResult closestSurface(float3 query,
                     // Sign against the face normal so "material where the model
                     // has none" reads differently from "missing material".
                     result.signedDistance = (dot(delta, normals[t].xyz) < 0.0) ? -d : d;
+                    result.delta = delta;
+                    result.element = as_type<uint>(triangles[t].v0.w);
                     result.found = true;
                 }
             }
@@ -186,6 +198,8 @@ kernel void computeDeviation(
     device const float4        *normals   [[buffer(5)]],
     constant     DeviationUniforms &u     [[buffer(6)]],
     device       DeviationStats  &stats   [[buffer(7)]],
+    device       uint          *elements  [[buffer(8)]],  // owning BIM element per vertex
+    device       float4        *deltas    [[buffer(9)]],  // model-space dX/dY/dZ out
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= u.vertexCount) return;
@@ -198,12 +212,16 @@ kernel void computeDeviation(
         // rather than a construction defect. Fade it out instead of flagging it.
         bands[gid] = kBandUnmatched;
         distances[gid] = NAN;
+        elements[gid] = kUnattributedElement;
+        deltas[gid] = float4(0.0);
         atomic_fetch_add_explicit(&stats.unmatchedCount, 1u, memory_order_relaxed);
         return;
     }
 
     bands[gid] = deviationBand(hit.signedDistance, u.toleranceMeters, u.saturationMeters);
     distances[gid] = hit.signedDistance;
+    elements[gid] = hit.element;
+    deltas[gid] = float4(hit.delta, hit.signedDistance);
 
     uint tenthMillimetres = (uint)clamp(hit.distance * 1.0e4, 0.0, 1.0e7);
     atomic_fetch_add_explicit(&stats.summedTenthMillimetres, tenthMillimetres, memory_order_relaxed);

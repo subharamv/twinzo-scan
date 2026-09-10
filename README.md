@@ -166,28 +166,107 @@ step is on you.
 ## Architecture
 
 ```
-ARKit (LiDAR mesh + camera)
-        |
-        |  ARMeshAnchor, budgeted at 3 chunks/frame
-        v
-ScanSession  ------->  ScanCloud        voxel-downsampled world cloud, for ICP
-        |
-        |              AlignmentCoordinator
-        |                  coarse: tap/drag/twist, gravity-constrained
-        |                  fine:   PointToPlaneICP, 2 passes, background queue
-        |                              |
-        v                              v
-DeviationEngine  <--- worldToModel ----+
-        |  Metal compute, 1 thread/vertex
-        v
-Deviation.metal  -->  BVH traversal, closest point on triangle, band index
-        |
-        v
-DeviationOverlay  -->  RealityKit mesh, per-face material segmentation
-DefectLog         -->  worst vertex per chunk, CSV export
+IFC4 -> server -> USDZ + <model>.elements.json      ARKit (LiDAR mesh + camera)
+                          |                                   |
+                          v                                   |  ARMeshAnchor,
+                  BIMModelLoader                              |  3 chunks/frame
+                  elements[], triangles tagged                v
+                  with their owning element  -----------> ScanSession
+                          |                                   |
+                          v                                   +--> ScanCloud
+                        BVH                                   |    (voxel cloud)
+                   /     |     \                              |
+       closestPoint    GPU     raycast                        v
+            |         arrays      |                  AlignmentCoordinator
+            v                     v                    targets: ControlPointRegistration
+      PointToPlaneICP      tap to identify               (Horn, 1/2/3+ points)
+            |               / pick a target             manual: tap/drag/twist
+            |                                           fine:   PointToPlaneICP
+            |                                           drift:  checkForDrift, cadenced
+            v                                                   |
+     DeviationEngine  <----------- worldToModel ----------------+
+            |  Metal compute, 1 thread/vertex
+            |  out: band, signed distance, element index, dX/dY/dZ
+            v
+     +------+-----------------+---------------------+
+     v                        v                     v
+DeviationOverlay      ElementInspectionEngine   DefectLog
+ (heat map)            per-element verdict       worst vertex per chunk
+                              |
+                       CoverageAnalyzer  <-- samples the DESIGN surface:
+                              |               what did nobody look at?
+                              v
+                       SessionUpload -> SyncOutbox (disk) -> TwinzoAPI -> MySQL
 ```
 
+### Module map
+
+Against the four-phase development plan:
+
+| Module | Where it lives | State |
+| --- | --- | --- |
+| M01 BIM import + metadata | `BIM/BIMElement.swift`, `BIM/BIMModel.swift`, `server/` | IFC4 -> USDZ + sidecar, server-side |
+| M02 BIM optimisation | `server/` tessellation; `BVH` on device | Sidecar contract defined |
+| M03 LiDAR capture | `AR/ScanSession.swift`, `Geometry/ScanCloud.swift` | Done |
+| M04 Camera + AR tracking | `AR/ARViewContainer.swift` | Done |
+| M05 Coordinate systems | `AlignmentCoordinator`, `projects` geo-referencing columns | Done |
+| M06 BIM/LiDAR/camera registration | `ControlPointRegistration`, `PointToPlaneICP`, `checkForDrift` | Manual, targets, ICP, drift correction |
+| M07 Spatial processing | `Geometry/BVH.swift`, `BVHRaycast.swift`, `OccupancyGrid` | Done |
+| M08 AR visualisation | `ScanSession.occludeModelWithScene`, ghost material | Done |
+| M09 On-the-fly deviation | `Deviation.metal`, `DeviationEngine`, `CoverageAnalyzer` | Both directions: scan->BIM and BIM->scan |
+| M10 Deviation visualisation | `DeviationOverlay`, `ElementDeviationCard` | Heat map + per-element card |
+| M11 Measurement | — | **Not built.** See Known limitations |
+| M12 Element identification | `ElementInspectionEngine`, `ElementInspectorView`, tap-to-identify | Done |
+| M13 AI visual analysis | — | Not started (marked optional/future) |
+| M14 Storage and sync | `Sync/`, `server/schema.sql` | Offline outbox + MySQL schema |
+| M15 Reporting | `v_session_summary`, `v_element_findings`, CSV/PLY export | Views done; PDF/BCF export not built |
+
 ### Why these choices
+
+**Element identity rides inside the triangle.** `GPUTriangle` packs the owning
+element index into the unused `w` lane of its first vertex. That costs nothing —
+the struct was already 48 bytes with three float4s — and it means identity
+survives the BVH's in-place partition swaps for free, and the GPU can report
+*which element* per vertex without a second buffer. Everything downstream depends
+on this: per-element verdicts, BCF round-tripping, per-class tolerances.
+
+**Deviation is measured in both directions.** The kernel walks scan vertices and
+finds the nearest design surface, which can only ever report on surfaces that
+were scanned. `CoverageAnalyzer` walks the other way: it samples the *design*
+surface and asks whether any scan return landed near each sample. Without it, a
+wall nobody walked past produces no vertices, contributes nothing to the
+statistics, and reads as flawless. `ElementStatus` therefore has four values, and
+`unverified` elements are reported, never omitted.
+
+**Scale is locked unless deliberately unlocked.** ARKit output is metric. A free
+scale parameter in the registration does not measure anything real — it absorbs
+registration error into a 0.98x fit, making every deviation 2% wrong while the
+residual looks better than ever. The only legitimate use is correcting a BIM
+export in the wrong units, and `ControlPointRegistration` treats that as a
+decision rather than a default. A single target cannot determine scale at all, so
+it refuses rather than inventing one.
+
+**Targets answer only what they can.** Three or more non-collinear points fix a
+pose; two fix a heading with roll and pitch from gravity; one fixes a position.
+The fit reports which of those it did, and refuses the degenerate cases —
+collinear targets, two points stacked vertically — instead of returning an
+arbitrary member of the solution family. With four or more, a leave-one-out pass
+names a mispaired target: comparing residuals against the RMS does not work,
+because least squares distributes the bad pick's error across every pair and
+inflates the RMS it would be compared against.
+
+**Registration is re-measured, not established once.** ARKit's world frame drifts
+over a long walkthrough, and a transform fitted at the door is measurably wrong at
+the far wall. `checkForDrift` re-runs ICP on a cadence and applies corrections
+under 15 mm silently, corrects and warns up to 60 mm, and refuses anything larger
+— a jump that big is more likely ICP finding a different bay than the world frame
+genuinely moving.
+
+**Upload is offline-first and idempotent.** Sites have no connectivity. Finished
+work is written to `SyncOutbox` on disk atomically before any network call, with
+capped exponential backoff, and a `clientChangeID` the server records so a retry
+after a lost response is a no-op. Entries that keep failing are set aside for a
+human, never discarded.
 
 **One BVH, two consumers.** `BVH.swift` builds a binned-SAH hierarchy over the
 model's triangles once at load. The CPU walks it for ICP correspondences; the GPU
@@ -235,6 +314,19 @@ both the CPU vertex copy and the GPU dispatch.
   established at one end of a bay degrades at the other; re-align periodically.
   Re-running ICP against a drifted cloud will partly absorb this, but the honest
   fix is re-anchoring against surveyed points.
+- **LOD 400 as-built is out of reach from this sensor alone.** LOD 400 implies
+  fabrication-level tolerance; iPhone LiDAR does not resolve it. Either scope the
+  deliverable to LOD 300/350 verification, or import a terrestrial scan (E57/LAS)
+  and let the phone be the guidance and issue-capture tool. See
+  [`server/README.md`](server/README.md).
+- **M11 measurement is not built.** `BVH.raycast` is in place and is what a
+  point-to-point measurement tool would be built on, but the tool itself and its
+  UI do not exist.
+- **Markups are schema-only.** The `markups` tables are BCF-shaped and ready, but
+  no capture UI or BCF export exists on the device yet.
+- **No server implementation.** `server/` holds the verified schema and the
+  upload contract. The import service, tessellator and authoritative recompute
+  are specified, not written.
 - **Unverified against a real model.** The code was written without a macOS
   toolchain available, so it has not been compiled or run on device. Expect to
   fix API details on first build, particularly around `MeshDescriptor` and the

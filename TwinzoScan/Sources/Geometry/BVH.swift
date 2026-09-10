@@ -10,6 +10,9 @@ struct SurfaceHit {
     /// Euclidean distance from the query point.
     var distance: Float
     var triangleIndex: Int
+    /// Index into `BIMModel.elements` of the element owning the hit triangle,
+    /// or `GPUTriangle.unattributedElement` when the model carried no metadata.
+    var elementIndex: UInt32
 }
 
 /// Binned-SAH bounding volume hierarchy over the BIM triangle soup.
@@ -244,7 +247,8 @@ final class BVH {
                         bestDistSq = d2
                         hit = SurfaceHit(
                             point: p, normal: normals[t],
-                            distance: sqrt(d2), triangleIndex: t
+                            distance: sqrt(d2), triangleIndex: t,
+                            elementIndex: triangles[t].elementIndex
                         )
                     }
                 }
@@ -306,5 +310,97 @@ final class BVH {
 
         let denom = 1 / (va + vb + vc)
         return a + ab * (vb * denom) + ac * (vc * denom)
+    }
+}
+
+// MARK: - Surface sampling
+
+extension BVH {
+
+    /// One sample of design surface, used to ask "did we actually scan this?".
+    struct SurfaceSample {
+        var point: SIMD3<Float>
+        var normal: SIMD3<Float>
+        /// Share of the owning triangle's area this sample stands for, in m^2.
+        var area: Float
+        var elementIndex: UInt32
+    }
+
+    /// Scatters sample points across the mesh at roughly `spacing` metres apart.
+    ///
+    /// Coverage has to be measured on the *design* surface, not the scan: a wall
+    /// nobody walked past produces no scan vertices at all, and a scan-driven
+    /// pass therefore reports it as flawless. Sampling the BIM instead is what
+    /// lets the report distinguish "verified in tolerance" from "never looked at",
+    /// which is the difference between an as-built record and a guess.
+    ///
+    /// Samples are area-weighted: each triangle gets a count proportional to its
+    /// area, so a 6 m^2 wall panel contributes six times what a 1 m^2 one does
+    /// regardless of how each was tessellated.
+    func sampleSurface(spacing: Float, limit: Int = 200_000) -> [SurfaceSample] {
+        guard !triangles.isEmpty, spacing > 0 else { return [] }
+        let cell = spacing * spacing
+
+        var samples: [SurfaceSample] = []
+        samples.reserveCapacity(min(limit, triangles.count * 2))
+
+        // Deterministic sequence rather than a random one: two runs over the same
+        // model must produce the same coverage number, or a report cannot be
+        // reproduced when it is challenged.
+        var seed: UInt64 = 0x2545_F491_4F6C_DD1D
+
+        for tri in triangles {
+            if samples.count >= limit { break }
+            let area = tri.area
+            guard area > 1e-9 else { continue }
+
+            let normal = normalize(tri.faceNormal)
+            let element = tri.elementIndex
+
+            // At least one sample per triangle so small elements are never
+            // silently dropped from the coverage denominator.
+            let count = Swift.max(1, Int((area / cell).rounded(.up)))
+            let share = area / Float(count)
+
+            for _ in 0..<count {
+                if samples.count >= limit { break }
+                // Uniform barycentric sampling: sqrt on the first coordinate is
+                // what stops samples bunching toward vertex `a`.
+                let u = Self.nextUnit(&seed).squareRoot()
+                let v = Self.nextUnit(&seed)
+                let w0 = 1 - u
+                let w1 = u * (1 - v)
+                let w2 = u * v
+                samples.append(SurfaceSample(
+                    point: tri.a * w0 + tri.b * w1 + tri.c * w2,
+                    normal: normal,
+                    area: share,
+                    elementIndex: element
+                ))
+            }
+        }
+        return samples
+    }
+
+    /// Total design surface area per element index, the denominator of coverage.
+    func areaByElement() -> [UInt32: Float] {
+        var out: [UInt32: Float] = [:]
+        for tri in triangles {
+            let area = tri.area
+            guard area > 1e-9 else { continue }
+            out[tri.elementIndex, default: 0] += area
+        }
+        return out
+    }
+
+    /// SplitMix64, inlined. A seeded generator keeps sampling reproducible
+    /// without dragging in a dependency or touching the global RNG.
+    private static func nextUnit(_ state: inout UInt64) -> Float {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        z = z ^ (z >> 31)
+        return Float(z >> 40) / Float(1 << 24)
     }
 }

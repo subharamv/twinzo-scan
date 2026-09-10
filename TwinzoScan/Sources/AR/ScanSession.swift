@@ -29,6 +29,14 @@ final class ScanSession: NSObject, ObservableObject {
 
     @Published private(set) var model: BIMModel?
     @Published private(set) var statistics = DeviationStatistics()
+    /// Per-element findings, refreshed on a throttle. This is the M12 output:
+    /// the form a deviation has to be in before anyone can act on it.
+    @Published private(set) var elementInspections: [ElementInspection] = []
+    @Published private(set) var inspectionSummary = InspectionSummary()
+    /// How much of the design model the scan has reached. Nil until a coverage
+    /// pass has been asked for.
+    @Published private(set) var coverage: CoverageReport?
+    @Published private(set) var isComputingCoverage = false
     @Published private(set) var meshAnchorCount = 0
     @Published private(set) var scanPointCount = 0
     @Published private(set) var errorMessage: String?
@@ -42,6 +50,22 @@ final class ScanSession: NSObject, ObservableObject {
     /// default: a solid model hides the very surfaces being inspected.
     @Published var ghostModel = true {
         didSet { applyModelAppearance() }
+    }
+    /// Let real geometry hide the BIM overlay behind it.
+    ///
+    /// Off by default, and it is a genuine trade rather than an oversight. With
+    /// occlusion on, the model sits believably inside the room and the AR reads
+    /// correctly; with it off, an operator can see the design surface *through*
+    /// the built one, which is exactly what they need when the question is "how
+    /// far apart are these two". Module 2 wants it on, module 5 wants it off.
+    @Published var occludeModelWithScene = false {
+        didSet { applySceneUnderstanding() }
+    }
+    /// Judge each element against the limit for its own class rather than one
+    /// project-wide number. On by default: a single tolerance across structure,
+    /// MEP and finishes is wrong for at least two of the three.
+    @Published var useClassTolerances = true {
+        didSet { invalidateAllOverlays(); publishInspections(force: true) }
     }
     /// Depth returns scored below this are refused entry to the scan cloud.
     ///
@@ -70,11 +94,80 @@ final class ScanSession: NSObject, ObservableObject {
     let alignment = AlignmentCoordinator()
     let defects = DefectLog()
 
+    /// What a tap on the camera view does.
+    ///
+    /// Modal rather than a set of separate gestures because all three want the
+    /// same one — a single unambiguous tap on a surface — and stacking them onto
+    /// tap counts or long presses on a device held at arm's length in a hard hat
+    /// is how an operator drops a target where they meant to identify a column.
+    enum InteractionMode: String, CaseIterable, Identifiable {
+        /// Drop the model where you tap, and slide and twist it into place.
+        case place
+        /// Tap a real surface, then the matching point on the model, to build a
+        /// surveyed target pair.
+        case target
+        /// Tap a surface to pull up the element it belongs to.
+        case identify
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .place:    return "Place"
+            case .target:   return "Targets"
+            case .identify: return "Identify"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .place:    return "hand.tap"
+            case .target:   return "scope"
+            case .identify: return "info.circle"
+            }
+        }
+    }
+
+    @Published var interactionMode: InteractionMode = .place {
+        didSet { pendingTargetWorldPoint = nil }
+    }
+
+    /// First half of a target pair: the real-world point, waiting for its
+    /// counterpart to be picked on the model.
+    @Published private(set) var pendingTargetWorldPoint: SIMD3<Float>?
+    /// Element the operator last tapped, shown in the identify card.
+    @Published private(set) var selectedElementIndex: UInt32?
+
+    var selectedInspection: ElementInspection? {
+        guard let selectedElementIndex else { return nil }
+        return elementInspections.first { $0.element.index == selectedElementIndex }
+    }
+
+    func selectElement(_ index: UInt32?) {
+        selectedElementIndex = index
+    }
+
     // MARK: Private state
 
     private weak var arView: ARView?
     private var deviation: DeviationEngine?
-    private let scanCloud = ScanCloud()
+    /// Grid pitch of the accumulated scan cloud, metres.
+    ///
+    /// One constant, not one per consumer. It sets the cloud, derives the
+    /// coverage search radius, and is uploaded as part of the session record —
+    /// and a second copy of it somewhere else would mean the number stored
+    /// alongside an inspection could stop describing the scan that produced it.
+    static let scanVoxelSize: Float = 0.05
+    private let scanCloud = ScanCloud(voxelSize: ScanSession.scanVoxelSize)
+    /// Per-element aggregation. Value type, mutated only on the main actor.
+    private var inspections = ElementInspectionEngine()
+    private var lastInspectionPublish = Date.distantPast
+    /// Rebuilding the published array walks every element in the model, which is
+    /// tens of thousands of rows on a real building. Twice a second is faster
+    /// than anyone reads and cheap enough to disappear into the frame budget.
+    private static let inspectionPublishInterval: TimeInterval = 0.5
+    private let coverageQueue = DispatchQueue(label: "com.twinzo.scan.coverage",
+                                              qos: .utility)
 
     /// Root for the BIM model, re-posed whenever the alignment changes.
     private var modelAnchor: AnchorEntity?
@@ -141,8 +234,8 @@ final class ScanSession: NSObject, ObservableObject {
 
         view.session.delegate = self
         view.automaticallyConfigureSession = false
-        view.environment.sceneUnderstanding.options = []
         view.renderOptions.insert(.disableMotionBlur)
+        applySceneUnderstanding()
         view.session.run(Self.makeConfiguration(),
                          options: [.resetTracking, .removeExistingAnchors])
 
@@ -206,6 +299,16 @@ final class ScanSession: NSObject, ObservableObject {
             clearOverlays()
             alignment.modelDidLoad()
             errorMessage = nil
+            if loaded.addressableFraction < 0.5 {
+                // Not an error — the app works fine without metadata — but the
+                // operator has to know before scanning rather than after that
+                // findings from this model cannot be written back to Revit.
+                errorMessage = String(
+                    format: "Only %.0f%% of the elements in this model carry an IFC id. Findings "
+                          + "will be reportable but will not round-trip to the authoring model. "
+                          + "Re-export with the elements.json sidecar to fix that.",
+                    loaded.addressableFraction * 100)
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -224,9 +327,105 @@ final class ScanSession: NSObject, ObservableObject {
 
     // MARK: - Placement and alignment
 
+    /// Dispatches a tap according to the current mode.
+    func handleTap(atScreenPoint point: CGPoint) {
+        switch interactionMode {
+        case .place:
+            guard !alignment.state.allowsDeviationAnalysis else { return }
+            placeModel(atScreenPoint: point)
+        case .target:
+            pickTarget(atScreenPoint: point)
+        case .identify:
+            identifyElement(atScreenPoint: point)
+        }
+    }
+
+    /// Casts the tap into the BIM model and returns what it hit.
+    ///
+    /// The ray is built in world space and then moved into model space, rather
+    /// than the model being moved: the BVH is millions of triangles and the ray
+    /// is two vectors. Direction is transformed as a direction, so a model placed
+    /// at a scale still gets a ray pointing the right way.
+    private func modelHit(atScreenPoint point: CGPoint) -> RayHit? {
+        guard let arView, let model, let ray = arView.ray(through: point) else { return nil }
+        let worldToModel = alignment.worldToModel
+        return model.bvh.raycast(
+            origin: worldToModel.transformPoint(ray.origin),
+            direction: worldToModel.transformDirection(ray.direction),
+            maxDistance: 60
+        )
+    }
+
+    /// Tap a surface, get the element. The whole of M12 in one gesture.
+    private func identifyElement(atScreenPoint point: CGPoint) {
+        guard model != nil else {
+            errorMessage = "Load a model before identifying elements."
+            return
+        }
+        guard let hit = modelHit(atScreenPoint: point) else {
+            selectedElementIndex = nil
+            errorMessage = "No model surface there. Aim at part of the overlaid model."
+            return
+        }
+        guard hit.elementIndex != GPUTriangle.unattributedElement else {
+            selectedElementIndex = nil
+            errorMessage = "That surface carries no element metadata, so it cannot be identified. "
+                         + "Re-export the model with its elements.json sidecar."
+            return
+        }
+        selectedElementIndex = hit.elementIndex
+        errorMessage = nil
+    }
+
+    /// Builds a target pair in two taps: the real point, then its counterpart on
+    /// the model.
+    ///
+    /// Two taps rather than one because the two points are genuinely different
+    /// measurements. The first is where the thing *is*; the second is where the
+    /// design says it should be. Collapsing them into one gesture would mean
+    /// guessing the correspondence, which is the one thing a surveyed alignment
+    /// exists to avoid.
+    private func pickTarget(atScreenPoint point: CGPoint) {
+        guard let arView, model != nil else {
+            errorMessage = "Load a model before placing targets."
+            return
+        }
+
+        guard let world = pendingTargetWorldPoint else {
+            let results = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any)
+            guard let hit = results.first else {
+                errorMessage = "No surface found there. Aim at the feature itself and try again."
+                return
+            }
+            pendingTargetWorldPoint = hit.worldTransform.translation
+            errorMessage = nil
+            return
+        }
+
+        guard let hit = modelHit(atScreenPoint: point) else {
+            errorMessage = "No model surface there. Tap the matching point on the overlaid model, "
+                         + "or start over."
+            return
+        }
+
+        alignment.addControlPoint(ControlPointPair(
+            worldPoint: world,
+            modelPoint: hit.point,
+            label: "Target \(alignment.controlPoints.count + 1)",
+            elementIndex: hit.elementIndex == GPUTriangle.unattributedElement
+                ? nil : hit.elementIndex
+        ))
+        pendingTargetWorldPoint = nil
+        errorMessage = nil
+    }
+
+    func cancelPendingTarget() {
+        pendingTargetWorldPoint = nil
+    }
+
     /// Places the model where the operator tapped, raycast against detected
-    /// geometry. Called from the tap gesture in `ARViewContainer`.
-    func placeModel(atScreenPoint point: CGPoint) {
+    /// geometry.
+    private func placeModel(atScreenPoint point: CGPoint) {
         guard let arView, model != nil else { return }
         let results = arView.raycast(from: point,
                                      allowing: .estimatedPlane,
@@ -330,7 +529,12 @@ final class ScanSession: NSObject, ObservableObject {
         dirtyAnchors.removeAll()
         perFrameStats.removeAll()
         defects.removeAll()
+        inspections.removeAll()
         statistics = DeviationStatistics()
+        // Coverage was measured against the alignment being torn down, so it has
+        // stopped being a statement about anything.
+        coverage = nil
+        publishInspections(force: true)
     }
 
     /// Marks every known anchor for re-evaluation. Needed after anything that
@@ -405,6 +609,18 @@ final class ScanSession: NSObject, ObservableObject {
             perFrameStats[id] = field.statistics
             defects.record(field: field, anchor: anchor,
                            positions: positions, tolerance: tolerances.tolerance)
+            inspections.ingest(
+                anchorID: id,
+                elementIndices: field.elementIndices,
+                signedDistances: field.signedDistances,
+                deltas: field.deltas,
+                positions: positions,
+                // Anchor space. The accumulator applies this only to the samples
+                // that turn out to be a chunk's worst, rather than to every
+                // vertex of every chunk on every frame.
+                positionTransform: anchor.transform,
+                toleranceFor: tolerance(forElement:)
+            )
             updateOverlayEntity(for: anchor, field: field, positions: positions)
         }
 
@@ -417,7 +633,98 @@ final class ScanSession: NSObject, ObservableObject {
         scanPointCount = scanCloud.count
         if canAnalyse {
             statistics = perFrameStats.values.reduce(DeviationStatistics(), +)
+            publishInspections()
+            runDriftCheckIfDue()
         }
+    }
+
+    // MARK: - Per-element results
+
+    /// Threshold one element is judged against.
+    ///
+    /// Falls back to the project-wide setting for anything unclassified rather
+    /// than guessing: an element whose class nobody established should be
+    /// measured against the number the operator chose, not one this app inferred
+    /// from a substring of its name.
+    private func tolerance(forElement index: UInt32) -> Float {
+        guard useClassTolerances,
+              let element = model?.element(at: index),
+              element.toleranceClass != .unclassified
+        else { return tolerances.tolerance }
+        return element.toleranceClass.settings.tolerance
+    }
+
+    private func publishInspections(force: Bool = false) {
+        guard let model else { return }
+        let now = Date()
+        guard force || now.timeIntervalSince(lastInspectionPublish)
+                >= Self.inspectionPublishInterval else { return }
+        lastInspectionPublish = now
+
+        let results = inspections.inspections(
+            elements: model.elements,
+            coverage: coverage?.byElement ?? [:],
+            toleranceFor: tolerance(forElement:)
+        )
+        elementInspections = results
+        inspectionSummary = InspectionSummary(results)
+    }
+
+    /// Elements that failed, worst first. What the inspector actually opens.
+    var failedInspections: [ElementInspection] {
+        elementInspections
+            .filter { $0.status == .fail }
+            .sorted { $0.maxAbsolute > $1.maxAbsolute }
+    }
+
+    // MARK: - Coverage
+
+    /// Measures how much of the design model the scan has reached.
+    ///
+    /// Run on demand rather than continuously: it samples the whole model, which
+    /// is seconds of work on a real building, and the answer only changes as fast
+    /// as somebody can walk.
+    func computeCoverage() {
+        guard let model, !isComputingCoverage,
+              alignment.state.allowsDeviationAnalysis else { return }
+
+        isComputingCoverage = true
+        let mesh = model.bvh
+        let points = scanCloud.points()
+        let worldToModel = alignment.worldToModel
+        let parameters = CoverageAnalyzer.Parameters.forVoxelSize(Self.scanVoxelSize)
+
+        coverageQueue.async { [weak self] in
+            let report = CoverageAnalyzer.analyze(
+                mesh: mesh, scanPoints: points,
+                worldToModel: worldToModel, parameters: parameters)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.coverage = report
+                self.isComputingCoverage = false
+                // Coverage changes verdicts: an element that read as passing on
+                // a handful of samples becomes insufficientData once we know how
+                // little of it was actually seen.
+                self.publishInspections(force: true)
+            }
+        }
+    }
+
+    // MARK: - Dynamic registration
+
+    /// Hands the drift monitor a fresh look at the scan when one is due.
+    ///
+    /// Driven from the frame loop rather than from a timer so it can never run
+    /// while the session is paused or backgrounded, and so it stops costing
+    /// anything the moment the operator stops scanning.
+    private func runDriftCheckIfDue() {
+        guard let model, alignment.shouldCheckForDrift else { return }
+        alignment.checkForDrift(using: scanCloud.points(), mesh: model.bvh)
+    }
+
+    private func applySceneUnderstanding() {
+        arView?.environment.sceneUnderstanding.options =
+            occludeModelWithScene ? [.occlusion] : []
     }
 
     private func updateOverlayEntity(
@@ -487,6 +794,7 @@ extension ScanSession: ARSessionDelegate {
             perFrameStats.removeValue(forKey: id)
             overlayEntities.removeValue(forKey: id)?.removeFromParent()
             defects.forget(anchorID: id)
+            inspections.forget(anchorID: id)
         }
         meshAnchorCount = knownAnchors.count
     }

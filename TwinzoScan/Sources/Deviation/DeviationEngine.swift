@@ -10,6 +10,12 @@ struct DeviationField {
     /// Signed distance to the nearest BIM surface, in metres. NaN where no
     /// surface fell within the rejection radius.
     var signedDistances: [Float]
+    /// Owning BIM element per vertex, or `GPUTriangle.unattributedElement`.
+    /// This is what turns a heat map into "column C-12 is 19 mm out".
+    var elementIndices: [UInt32]
+    /// Model-space vector from the design surface to the scanned point; `w`
+    /// repeats the signed distance so one buffer read serves both consumers.
+    var deltas: [SIMD4<Float>]
     var statistics: DeviationStatistics
 }
 
@@ -33,6 +39,8 @@ final class DeviationEngine {
     // per-frame allocation count at zero once the scan reaches steady state.
     private var bandBuffer: MTLBuffer?
     private var distanceBuffer: MTLBuffer?
+    private var elementBuffer: MTLBuffer?
+    private var deltaBuffer: MTLBuffer?
     private var statsBuffer: MTLBuffer
 
     var tolerances = ToleranceSettings()
@@ -115,7 +123,7 @@ final class DeviationEngine {
         let combined = worldToModel * anchor.transform
 
         ensureScratchCapacity(vertexCount: vertexCount)
-        guard let bandBuffer, let distanceBuffer,
+        guard let bandBuffer, let distanceBuffer, let elementBuffer, let deltaBuffer,
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
         else { return nil }
@@ -139,6 +147,8 @@ final class DeviationEngine {
         encoder.setBuffer(normalBuffer, offset: 0, index: 5)
         encoder.setBytes(&uniforms, length: MemoryLayout<DeviationUniforms>.stride, index: 6)
         encoder.setBuffer(statsBuffer, offset: 0, index: 7)
+        encoder.setBuffer(elementBuffer, offset: 0, index: 8)
+        encoder.setBuffer(deltaBuffer, offset: 0, index: 9)
 
         let width = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
         encoder.dispatchThreads(
@@ -159,24 +169,39 @@ final class DeviationEngine {
             start: distanceBuffer.contents().assumingMemoryBound(to: Float.self),
             count: vertexCount
         ))
+        let elements = Array(UnsafeBufferPointer(
+            start: elementBuffer.contents().assumingMemoryBound(to: UInt32.self),
+            count: vertexCount
+        ))
+        let deltas = Array(UnsafeBufferPointer(
+            start: deltaBuffer.contents().assumingMemoryBound(to: SIMD4<Float>.self),
+            count: vertexCount
+        ))
 
         return DeviationField(bands: bands,
                               signedDistances: distances,
+                              elementIndices: elements,
+                              deltas: deltas,
                               statistics: readStatistics())
     }
 
     private func ensureScratchCapacity(vertexCount: Int) {
         let bandLength = MemoryLayout<UInt32>.stride * vertexCount
-        if (bandBuffer?.length ?? 0) < bandLength {
-            // Over-allocate so a slowly growing anchor does not reallocate every
-            // time ARKit refines it.
-            bandBuffer = device.makeBuffer(length: Int(Double(bandLength) * 1.5),
-                                           options: .storageModeShared)
-            distanceBuffer = device.makeBuffer(
-                length: Int(Double(MemoryLayout<Float>.stride * vertexCount) * 1.5),
-                options: .storageModeShared
-            )
+        guard (bandBuffer?.length ?? 0) < bandLength else { return }
+
+        // Over-allocate so a slowly growing anchor does not reallocate every
+        // time ARKit refines it. All four scratch buffers are grown together
+        // and gated on the same check: sizing them independently is how one
+        // ends up a frame behind the others and the kernel writes past its end.
+        let headroom = 1.5
+        func scratch(_ stride: Int) -> MTLBuffer? {
+            device.makeBuffer(length: Int(Double(stride * vertexCount) * headroom),
+                              options: .storageModeShared)
         }
+        bandBuffer = scratch(MemoryLayout<UInt32>.stride)
+        distanceBuffer = scratch(MemoryLayout<Float>.stride)
+        elementBuffer = scratch(MemoryLayout<UInt32>.stride)
+        deltaBuffer = scratch(MemoryLayout<SIMD4<Float>>.stride)
     }
 
     private func readStatistics() -> DeviationStatistics {

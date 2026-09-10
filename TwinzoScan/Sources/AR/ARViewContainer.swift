@@ -56,13 +56,17 @@ struct ARViewContainer: UIViewRepresentable {
         /// useful, fine enough to line a wall up by eye.
         private let panSensitivity: Float = 0.004
 
+        /// Gating lives in the session now: identifying an element and dropping a
+        /// target are both wanted *after* registration, and only placement has to
+        /// stop once the model is registered.
         @objc func handleTap(_ recogniser: UITapGestureRecognizer) {
-            guard let session, !session.alignment.state.allowsDeviationAnalysis else { return }
-            session.placeModel(atScreenPoint: recogniser.location(in: recogniser.view))
+            guard let session else { return }
+            session.handleTap(atScreenPoint: recogniser.location(in: recogniser.view))
         }
 
         @objc func handlePan(_ recogniser: UIPanGestureRecognizer) {
-            guard let session, !session.alignment.state.allowsDeviationAnalysis else { return }
+            guard let session, session.interactionMode == .place,
+                  !session.alignment.state.allowsDeviationAnalysis else { return }
             let translation = recogniser.translation(in: recogniser.view)
             recogniser.setTranslation(.zero, in: recogniser.view)
 
@@ -75,7 +79,8 @@ struct ARViewContainer: UIViewRepresentable {
         }
 
         @objc func handleRotate(_ recogniser: UIRotationGestureRecognizer) {
-            guard let session, !session.alignment.state.allowsDeviationAnalysis else { return }
+            guard let session, session.interactionMode == .place,
+                  !session.alignment.state.allowsDeviationAnalysis else { return }
             session.alignment.rotate(byRadians: Float(-recogniser.rotation))
             recogniser.rotation = 0
         }

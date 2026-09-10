@@ -33,7 +33,14 @@ let package = Package(
             sources: [
                 "Geometry",
                 "Alignment/PointToPlaneICP.swift",
+                "Alignment/AlignmentMethod.swift",
+                "Alignment/ControlPointRegistration.swift",
+                "BIM/BIMElement.swift",
                 "Deviation/DeviationStatistics.swift",
+                "Deviation/ElementInspection.swift",
+                "Deviation/CoverageAnalyzer.swift",
+                "Sync/SyncPayloads.swift",
+                "Sync/SyncOutbox.swift",
             ]
         ),
 

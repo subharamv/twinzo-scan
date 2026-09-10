@@ -57,9 +57,31 @@ struct ToleranceSettingsView: View {
                        + "build at all.")
                 }
 
-                Section("Display") {
+                Section {
                     Toggle("Show passing surface", isOn: $session.showInToleranceSurface)
                     Toggle("Ghost the BIM model", isOn: $session.ghostModel)
+                    Toggle("Hide model behind real geometry",
+                           isOn: $session.occludeModelWithScene)
+                } header: {
+                    Text("Display")
+                } footer: {
+                    Text("Occlusion makes the model sit believably inside the room, which is what "
+                       + "you want while walking it. Turn it off to see the design surface "
+                       + "through the built one, which is what you want while measuring the gap "
+                       + "between them.")
+                }
+
+                Section {
+                    Toggle("Tolerance by element class", isOn: $session.useClassTolerances)
+                } header: {
+                    Text("Acceptance")
+                } footer: {
+                    Text("Judges structure at \(DeviationFormat.millimetres(ToleranceSettings.structural.tolerance)), "
+                       + "MEP at \(DeviationFormat.millimetres(ToleranceSettings.mep.tolerance)) and "
+                       + "finishes at \(DeviationFormat.millimetres(ToleranceSettings.finishes.tolerance)), "
+                       + "instead of one number for everything. Elements whose class the model "
+                       + "does not establish fall back to the slider above rather than being "
+                       + "graded against a guess.")
                 }
 
                 Section {
@@ -145,6 +167,16 @@ struct ToleranceSettingsView: View {
                         LabeledContent("Extent", value: String(
                             format: "%.1f × %.1f × %.1f m",
                             model.sizeMeters.x, model.sizeMeters.y, model.sizeMeters.z))
+                        LabeledContent("Elements", value: "\(model.elements.count)")
+                        LabeledContent("With IFC id",
+                                       value: DeviationFormat.percent(model.addressableFraction))
+                        if let version = model.modelVersionID {
+                            LabeledContent("Version", value: version)
+                        }
+                        if abs(model.unitScale - 1) > 1e-6 {
+                            LabeledContent("Unit scale",
+                                           value: String(format: "%g", model.unitScale))
+                        }
                     }
                 }
 
