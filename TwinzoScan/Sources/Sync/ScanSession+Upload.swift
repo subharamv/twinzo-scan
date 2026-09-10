@@ -94,9 +94,10 @@ extension ScanSession {
     static var hardwareIdentifier: String {
         var info = utsname()
         uname(&info)
-        return withUnsafePointer(to: &info.machine) { pointer in
+        let machine = info.machine
+        return withUnsafePointer(to: machine) { pointer in
             pointer.withMemoryRebound(to: CChar.self,
-                                      capacity: MemoryLayout.size(ofValue: info.machine)) {
+                                      capacity: MemoryLayout.size(ofValue: machine)) {
                 String(validatingUTF8: $0) ?? "unknown"
             }
         }
